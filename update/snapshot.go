@@ -5,6 +5,12 @@ import (
 	"sort"
 )
 
+// Snapshot 实现 gameloop.World 接口，生成世界在当前 Tick 的只读快照。
+//
+// 遍历所有活跃实体，从各组件 store 中聚合数据组装 EntitySnapshot。
+// 对 ctx 的检查每 128 个实体执行一次，平衡精度与开销，支持超时/取消。
+//
+// 参考：游戏循环模式——定期将只读快照发布给网络层或持久化层。
 func (w *World) Snapshot(ctx context.Context, tick uint64) (any, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -46,7 +52,7 @@ func (w *World) Snapshot(ctx context.Context, tick uint64) (any, error) {
 			entity.PlayerID = state.PlayerID
 		}
 		if buffs, ok := w.buffs.get(id); ok {
-			entity.Buffs = append([]Buff(nil), (*buffs)...)
+			entity.Buffs = append([]Buff(nil), *buffs...)
 		}
 		entities = append(entities, entity)
 	}
