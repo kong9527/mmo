@@ -1,13 +1,14 @@
-package update
+package world
 
 import "context"
 
 // recoverySystem 负责实体的自然生命回复。
 //
 // 每个 Tick 遍历所有有 Health 组件的实体，对满足以下条件的进行回复：
-//  — 活跃且未死亡
-//  — RecoveryPerSecond > 0
-//  — 当前生命值未满
+//
+//	— 活跃且未死亡
+//	— RecoveryPerSecond > 0
+//	— 当前生命值未满
 //
 // 回复量 = RecoveryPerSecond × dt，钳制不超过 Maximum。
 //

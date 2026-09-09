@@ -1,48 +1,48 @@
 package example
 
 import (
+	"mmo/world"
 	"time"
 
 	"mmo/gameloop"
-	"mmo/update"
 )
 
 type DemoEntities struct {
-	Player  update.EntityID
-	Monster update.EntityID
+	Player  world.EntityID
+	Monster world.EntityID
 }
 
 // NewMMOLoop wires the hybrid-ECS MMO world into the existing fixed-step game
 // loop. Callers may seed players and monsters through world before Run starts.
 func NewMMOLoop(
 	loopConfig gameloop.Config,
-	worldConfig update.Config,
+	worldConfig world.Config,
 	publisher gameloop.SnapshotPublisher,
 	observer gameloop.Observer,
-) (*gameloop.Loop, *update.World, error) {
-	world, err := update.NewWorld(worldConfig)
+) (*gameloop.Loop, *world.World, error) {
+	w, err := world.NewWorld(worldConfig)
 	if err != nil {
 		return nil, nil, err
 	}
-	loop, err := gameloop.New(loopConfig, world, publisher, observer)
+	loop, err := gameloop.New(loopConfig, w, publisher, observer)
 	if err != nil {
 		return nil, nil, err
 	}
-	return loop, world, nil
+	return loop, w, nil
 }
 
 // SeedDemoScene creates one player and one AI-controlled monster. It is kept
 // separate from NewMMOLoop so production callers can load their own scene data.
-func SeedDemoScene(world *update.World) (DemoEntities, error) {
-	player, err := world.AddPlayer(update.PlayerSpec{
+func SeedDemoScene(w *world.World) (DemoEntities, error) {
+	player, err := w.AddPlayer(world.PlayerSpec{
 		PlayerID: "player-1",
-		Position: update.Vec2{X: 0, Y: 0},
-		Health: update.Health{
+		Position: world.Vec2{X: 0, Y: 0},
+		Health: world.Health{
 			Current:           100,
 			Maximum:           100,
 			RecoveryPerSecond: 1,
 		},
-		Combat: update.Combat{
+		Combat: world.Combat{
 			Damage:   12,
 			Range:    2,
 			Cooldown: 800 * time.Millisecond,
@@ -51,19 +51,19 @@ func SeedDemoScene(world *update.World) (DemoEntities, error) {
 	if err != nil {
 		return DemoEntities{}, err
 	}
-	monster, err := world.AddMonster(update.MonsterSpec{
-		Position: update.Vec2{X: 8, Y: 0},
+	monster, err := w.AddMonster(world.MonsterSpec{
+		Position: world.Vec2{X: 8, Y: 0},
 		MaxSpeed: 2.5,
-		Health: update.Health{
+		Health: world.Health{
 			Current: 60,
 			Maximum: 60,
 		},
-		Combat: update.Combat{
+		Combat: world.Combat{
 			Damage:   6,
 			Range:    1.5,
 			Cooldown: time.Second,
 		},
-		AI: update.AI{
+		AI: world.AI{
 			AggroRange: 20,
 			MoveSpeed:  2.5,
 		},
@@ -74,11 +74,11 @@ func SeedDemoScene(world *update.World) (DemoEntities, error) {
 	return DemoEntities{Player: player, Monster: monster}, nil
 }
 
-func DemoMoveCommand(playerID string, sequence uint64, velocity update.Vec2) gameloop.Command {
+func DemoMoveCommand(playerID string, sequence uint64, velocity world.Vec2) gameloop.Command {
 	return gameloop.Command{
 		PlayerID:   playerID,
 		Seq:        sequence,
-		Payload:    update.MoveCommand{Velocity: velocity},
+		Payload:    world.MoveCommand{Velocity: velocity},
 		ReceivedAt: time.Now(),
 	}
 }
@@ -87,13 +87,13 @@ func DemoAttackCommand(
 	playerID string,
 	sequence uint64,
 	applyTick uint64,
-	target update.EntityID,
+	target world.EntityID,
 ) gameloop.Command {
 	return gameloop.Command{
 		PlayerID:   playerID,
 		Seq:        sequence,
 		ApplyTick:  applyTick,
-		Payload:    update.AttackCommand{Target: target},
+		Payload:    world.AttackCommand{Target: target},
 		ReceivedAt: time.Now(),
 	}
 }
@@ -101,16 +101,16 @@ func DemoAttackCommand(
 func DemoBurnCommand(
 	playerID string,
 	sequence uint64,
-	target update.EntityID,
+	target world.EntityID,
 ) gameloop.Command {
 	return gameloop.Command{
 		PlayerID: playerID,
 		Seq:      sequence,
-		Payload: update.ApplyBuffCommand{
+		Payload: world.ApplyBuffCommand{
 			Target: target,
-			Buff: update.Buff{
+			Buff: world.Buff{
 				ID:        "burn",
-				Kind:      update.BuffDamageOverTime,
+				Kind:      world.BuffDamageOverTime,
 				Duration:  3 * time.Second,
 				Period:    time.Second,
 				Magnitude: 4,

@@ -1,4 +1,4 @@
-package update
+package world
 
 import (
 	"errors"
@@ -153,7 +153,7 @@ type Transform struct {
 
 // Movement 描述实体的运动状态。
 type Movement struct {
-	Velocity Vec2   // 当前速度（单位/秒）
+	Velocity Vec2    // 当前速度（单位/秒）
 	MaxSpeed float64 // 最大速率上限
 }
 

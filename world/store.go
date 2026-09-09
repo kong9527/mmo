@@ -1,4 +1,4 @@
-package update
+package world
 
 // store 是一个基于稀疏集合的组件存储。
 //
