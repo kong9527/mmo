@@ -85,6 +85,10 @@ type World struct {
 	// 本 Tick 产生的事件（发布后清空）
 	events []Event
 
+	// World 内部事件队列。
+	// 用于系统间解耦通知，不替代 Snapshot 中的事件输出。
+	eventQueue *EventQueue
+
 	// 本 Tick 内收集的攻击意图
 	attackIntents []attackIntent
 	// 延迟执行的创建/删除请求
@@ -113,6 +117,7 @@ func NewWorld(cfg Config) (*World, error) {
 		playerState:     newStore[PlayerState](capacity),
 		buffs:           newStore[[]Buff](capacity),
 		events:          make([]Event, 0, capacity),
+		eventQueue:      NewEventQueue(128),
 		attackIntents:   make([]attackIntent, 0, capacity),
 		pendingSpawns:   make([]spawnRequest, 0, 16),
 		pendingRemovals: make([]EntityID, 0, 16),
@@ -131,6 +136,12 @@ func NewWorld(cfg Config) (*World, error) {
 // Config 返回世界的运行配置（只读）。
 func (w *World) Config() Config {
 	return w.cfg
+}
+
+// SubscribeEvent 注册 World 内部事件监听器。
+// 现有 Snapshot 事件流程保持不变，新系统可逐步迁移到这里。
+func (w *World) SubscribeEvent(eventType EventType, handler EventHandler) {
+	w.eventQueue.Subscribe(eventType, handler)
 }
 
 // Tick 返回已完成的最新逻辑 Tick 序号。
@@ -434,6 +445,8 @@ func (w *World) Step(ctx context.Context, tick uint64, dt time.Duration, command
 	if err := w.flushStructuralChanges(); err != nil {
 		return fmt.Errorf("tick %d structural changes: %w", tick, err)
 	}
+	w.eventQueue.Dispatch()
+
 	w.tick = tick
 	return nil
 }
@@ -500,6 +513,7 @@ func (w *World) removeEntityNow(id EntityID) {
 func (w *World) emit(event Event) {
 	event.Tick = w.currentTick()
 	w.events = append(w.events, event)
+	w.eventQueue.Push(event)
 }
 
 // currentTick 返回当前"有效"的 Tick 序号。
