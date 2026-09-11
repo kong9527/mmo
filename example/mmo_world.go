@@ -1,11 +1,39 @@
 package example
 
 import (
-	"mmo/world"
+	"context"
 	"time"
 
+	"mmo/backend"
 	"mmo/gameloop"
+	"mmo/world"
 )
+
+// NewMMOLoopWithBackend creates the existing World and Loop plus one shared
+// in-process asynchronous executor. Existing NewMMOLoop callers are unchanged.
+func NewMMOLoopWithBackend(
+	loopConfig gameloop.Config,
+	worldConfig world.Config,
+	backendConfig backend.Config,
+	publisher gameloop.SnapshotPublisher,
+	observer gameloop.Observer,
+) (*gameloop.Loop, *world.World, *backend.Executor, error) {
+	executor, err := backend.New(backendConfig)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	loop, w, err := NewMMOLoop(loopConfig, worldConfig, publisher, observer)
+	if err != nil {
+		_ = executor.Close(context.Background())
+		return nil, nil, nil, err
+	}
+	if err := w.AttachBackend(executor); err != nil {
+		_ = executor.Close(context.Background())
+		return nil, nil, nil, err
+	}
+	RegisterLoadPlayerHealthHandler(w)
+	return loop, w, executor, nil
+}
 
 type DemoEntities struct {
 	Player  world.EntityID

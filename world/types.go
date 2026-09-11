@@ -27,7 +27,18 @@ var (
 	ErrUnsupportedCommand = errors.New("unsupported command")
 	// ErrInvalidCommand 命令参数非法（如 Target 为 0）。
 	ErrInvalidCommand = errors.New("invalid command")
+	// ErrBackendAlreadyAttached 表示 World 已绑定异步 Backend。
+	ErrBackendAlreadyAttached = errors.New("backend already attached")
+	// ErrBackendRequired 表示绑定的 Backend 为空。
+	ErrBackendRequired = errors.New("backend is required")
+	// ErrBackendNotAttached 表示 World 尚未绑定异步 Backend。
+	ErrBackendNotAttached = errors.New("backend is not attached")
+	// ErrBackendTaskIdentity 表示任务不属于当前 World、房间或实体版本。
+	ErrBackendTaskIdentity = errors.New("backend task identity mismatch")
 )
+
+// WorldID 是一次 World 实例的唯一标识。World 重建后应使用新的 ID。
+type WorldID uint64
 
 // EntityID 是实体在 World 中的唯一标识。
 // 由 World 在实体创建时分配，零值表示无效 ID。
@@ -104,8 +115,16 @@ func clampMagnitude(value Vec2, maximum float64) Vec2 {
 // 控制实体的数量上限、玩家和怪物的默认属性，
 // 在创建 World 时传入并校验。
 type Config struct {
+	// WorldID 标识当前 World 实例；0 表示由 NewWorld 自动分配。
+	WorldID WorldID
+	// RoomID 沿用 gameloop.Manager 的字符串房间标识。
+	RoomID string
 	// MaxEntities 世界内最大实体数量（含玩家和怪物）。
 	MaxEntities int
+	// BackendResultQueueSize 是为当前 World 保留的异步结果容量。
+	BackendResultQueueSize int
+	// MaxBackendResultsPerTick 限制每个 Tick 最多应用多少个异步结果。
+	MaxBackendResultsPerTick int
 	// PlayerMaxSpeed 玩家移动的最大速度（单位/秒）。
 	PlayerMaxSpeed float64
 	// DefaultPlayerHP 新玩家实体的初始最大生命值。
@@ -119,16 +138,26 @@ type Config struct {
 // DefaultConfig 返回一套适合中等规模 MMO 场景的默认配置。
 func DefaultConfig() Config {
 	return Config{
-		MaxEntities:       4096,
-		PlayerMaxSpeed:    8,
-		DefaultPlayerHP:   100,
-		DefaultMonsterHP:  50,
-		DefaultAggroRange: 20,
+		WorldID:                  0,
+		RoomID:                   "default",
+		MaxEntities:              4096,
+		BackendResultQueueSize:   1024,
+		MaxBackendResultsPerTick: 128,
+		PlayerMaxSpeed:           8,
+		DefaultPlayerHP:          100,
+		DefaultMonsterHP:         50,
+		DefaultAggroRange:        20,
 	}
 }
 
 // validate 校验配置，失败返回 ErrInvalidConfig。
 func (c Config) validate() error {
+	if c.WorldID == 0 {
+		return fmt.Errorf("%w: WorldID must be nonzero", ErrInvalidConfig)
+	}
+	if c.RoomID == "" {
+		return fmt.Errorf("%w: RoomID is required", ErrInvalidConfig)
+	}
 	if c.MaxEntities <= 0 {
 		return fmt.Errorf("%w: MaxEntities must be positive", ErrInvalidConfig)
 	}
@@ -140,6 +169,12 @@ func (c Config) validate() error {
 	}
 	if c.DefaultAggroRange < 0 {
 		return fmt.Errorf("%w: DefaultAggroRange cannot be negative", ErrInvalidConfig)
+	}
+	if c.BackendResultQueueSize <= 0 {
+		return fmt.Errorf("%w: BackendResultQueueSize must be positive", ErrInvalidConfig)
+	}
+	if c.MaxBackendResultsPerTick <= 0 {
+		return fmt.Errorf("%w: MaxBackendResultsPerTick must be positive", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -303,6 +338,7 @@ type Event struct {
 // EntitySnapshot 是单个实体在某个 Tick 的只读快照。
 type EntitySnapshot struct {
 	ID        EntityID   // 实体 ID
+	Epoch     uint32     // 实体版本，用于过滤异步任务的旧结果
 	Kind      EntityKind // 实体类别
 	PlayerID  string     // 玩家外部 ID；非玩家实体为空
 	Position  Vec2       // 当前位置
@@ -318,6 +354,8 @@ type EntitySnapshot struct {
 // Snapshot 是某一 Tick 结束后的世界只读快照。
 // 并发安全：由 World.Step 在单 goroutine 中生成，外部只读。
 type Snapshot struct {
+	WorldID  WorldID          // 产生快照的 World 实例
+	RoomID   string           // 产生快照的房间
 	Tick     uint64           // 逻辑 Tick 序号
 	Entities []EntitySnapshot // 本帧所有活跃实体的快照
 	Events   []Event          // 本帧产生的所有事件

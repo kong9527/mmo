@@ -32,7 +32,7 @@ func (w *World) Snapshot(ctx context.Context, tick uint64) (any, error) {
 			}
 		}
 		record := w.entities[id]
-		entity := EntitySnapshot{ID: id, Kind: record.kind}
+		entity := EntitySnapshot{ID: id, Epoch: record.epoch, Kind: record.kind}
 		if transform, ok := w.transforms.get(id); ok {
 			entity.Position = transform.Position
 			entity.Facing = transform.Facing
@@ -58,6 +58,8 @@ func (w *World) Snapshot(ctx context.Context, tick uint64) (any, error) {
 	}
 
 	return Snapshot{
+		WorldID:  w.cfg.WorldID,
+		RoomID:   w.cfg.RoomID,
 		Tick:     tick,
 		Entities: entities,
 		Events:   append([]Event(nil), w.events...),

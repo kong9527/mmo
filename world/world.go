@@ -3,19 +3,24 @@ package world
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"mmo/backend"
 	"mmo/gameloop"
 )
 
 // 编译期断言：*World 实现了 gameloop.World 接口。
 var _ gameloop.World = (*World)(nil)
 
+var worldIDSequence atomic.Uint64
+
 // entityRecord 记录实体的分类和活跃状态。
 // 轻量元数据，组件数据分别存储在各自的 store 中。
 type entityRecord struct {
 	kind   EntityKind // 实体类别
 	active bool       // 是否活跃（false 表示已标记待删除）
+	epoch  uint32     // 实体版本，异步结果必须匹配该版本
 }
 
 // spawnRequest 是延迟创建的请求，在 Tick 末尾统一处理。
@@ -58,8 +63,9 @@ type World struct {
 	cfg Config
 
 	// 内部 ID 分配
-	nextEntityID EntityID // 下一个实体 ID
-	nextBuffID   uint64   // 下一个 Buff ID
+	nextEntityID    EntityID // 下一个实体 ID
+	nextEntityEpoch uint32   // 下一个实体版本
+	nextBuffID      uint64   // 下一个 Buff ID
 
 	// Tick 状态
 	tick           uint64   // 已完成的最新 Tick 序号
@@ -94,6 +100,11 @@ type World struct {
 	// 延迟执行的创建/删除请求
 	pendingSpawns   []spawnRequest
 	pendingRemovals []EntityID
+
+	// Backend 只提供结果邮箱；所有 handler 都在 World.Step goroutine 内执行。
+	backend             backend.Service
+	backendHandlers     map[backend.TaskKind]BackendResultHandler
+	pendingBackendTasks map[backend.TaskID]struct{}
 }
 
 // NewWorld 创建并初始化一个新的游戏世界。
@@ -101,26 +112,29 @@ type World struct {
 //
 //	movement → ai → combat → buff → recovery → cleanup
 func NewWorld(cfg Config) (*World, error) {
+	cfg.WorldID = allocateWorldID(cfg.WorldID)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	capacity := cfg.MaxEntities
 	w := &World{
-		cfg:             cfg,
-		entities:        make(map[EntityID]entityRecord, capacity),
-		players:         make(map[string]EntityID, capacity),
-		transforms:      newStore[Transform](capacity),
-		movements:       newStore[Movement](capacity),
-		health:          newStore[Health](capacity),
-		combat:          newStore[Combat](capacity),
-		ai:              newStore[AI](capacity),
-		playerState:     newStore[PlayerState](capacity),
-		buffs:           newStore[[]Buff](capacity),
-		events:          make([]Event, 0, capacity),
-		eventQueue:      NewEventQueue(128),
-		attackIntents:   make([]attackIntent, 0, capacity),
-		pendingSpawns:   make([]spawnRequest, 0, 16),
-		pendingRemovals: make([]EntityID, 0, 16),
+		cfg:                 cfg,
+		entities:            make(map[EntityID]entityRecord, capacity),
+		players:             make(map[string]EntityID, capacity),
+		transforms:          newStore[Transform](capacity),
+		movements:           newStore[Movement](capacity),
+		health:              newStore[Health](capacity),
+		combat:              newStore[Combat](capacity),
+		ai:                  newStore[AI](capacity),
+		playerState:         newStore[PlayerState](capacity),
+		buffs:               newStore[[]Buff](capacity),
+		events:              make([]Event, 0, capacity),
+		eventQueue:          NewEventQueue(128),
+		attackIntents:       make([]attackIntent, 0, capacity),
+		pendingSpawns:       make([]spawnRequest, 0, 16),
+		pendingRemovals:     make([]EntityID, 0, 16),
+		backendHandlers:     make(map[backend.TaskKind]BackendResultHandler),
+		pendingBackendTasks: make(map[backend.TaskID]struct{}),
 	}
 	w.systems = []system{
 		movementSystem{},
@@ -133,10 +147,31 @@ func NewWorld(cfg Config) (*World, error) {
 	return w, nil
 }
 
+func allocateWorldID(requested WorldID) WorldID {
+	if requested == 0 {
+		return WorldID(worldIDSequence.Add(1))
+	}
+	for {
+		current := worldIDSequence.Load()
+		if current >= uint64(requested) {
+			return requested
+		}
+		if worldIDSequence.CompareAndSwap(current, uint64(requested)) {
+			return requested
+		}
+	}
+}
+
 // Config 返回世界的运行配置（只读）。
 func (w *World) Config() Config {
 	return w.cfg
 }
+
+// ID 返回当前 World 实例 ID。
+func (w *World) ID() WorldID { return w.cfg.WorldID }
+
+// RoomID 返回当前 World 所属房间 ID。
+func (w *World) RoomID() string { return w.cfg.RoomID }
 
 // SubscribeEvent 注册 World 内部事件监听器。
 // 现有 Snapshot 事件流程保持不变，新系统可逐步迁移到这里。
@@ -159,6 +194,15 @@ func (w *World) LastSpawnedEntity() EntityID {
 func (w *World) Exists(id EntityID) bool {
 	_, ok := w.entities[id]
 	return ok
+}
+
+// EntityEpoch 返回实体当前版本。实体不存在时返回 false。
+func (w *World) EntityEpoch(id EntityID) (uint32, bool) {
+	record, ok := w.entities[id]
+	if !ok {
+		return 0, false
+	}
+	return record.epoch, true
 }
 
 // Active 判断实体是否仍活跃（未被标记删除或死亡）。
@@ -356,7 +400,11 @@ func (w *World) allocateEntity(kind EntityKind) (EntityID, error) {
 	}
 	w.nextEntityID++
 	id := w.nextEntityID
-	w.entities[id] = entityRecord{kind: kind, active: true}
+	w.nextEntityEpoch++
+	if w.nextEntityEpoch == 0 {
+		w.nextEntityEpoch++
+	}
+	w.entities[id] = entityRecord{kind: kind, active: true, epoch: w.nextEntityEpoch}
 	return id, nil
 }
 
@@ -400,9 +448,10 @@ func normalizeCombat(value Combat) Combat {
 // 处理流程：
 //  1. 校验 Tick 单调递增且 dt > 0
 //  2. 清空上一帧的事件和攻击意图
-//  3. 处理外部输入命令（移动、攻击、Buff、生成怪物等）
-//  4. 按顺序执行各子系统：movement → ai → combat → buff → recovery → cleanup
-//  5. 统一提交延迟的创建/删除操作
+//  3. 限量处理 Backend 已完成的结果
+//  4. 处理外部输入命令（移动、攻击、Buff、生成怪物等）
+//  5. 按顺序执行各子系统：movement → ai → combat → buff → recovery → cleanup
+//  6. 统一提交延迟的创建/删除操作
 //
 // 参考：更新方法模式——每一帧游戏循环遍历对象调用 update()。
 // 这里不是遍历 Entity 对象，而是按领域依次执行 system，
@@ -423,6 +472,7 @@ func (w *World) Step(ctx context.Context, tick uint64, dt time.Duration, command
 
 	w.events = w.events[:0]
 	w.attackIntents = w.attackIntents[:0]
+	w.consumeBackendResults()
 
 	for i, command := range commands {
 		if err := ctx.Err(); err != nil {
