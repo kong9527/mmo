@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"mmo/backend"
+
+	"github.com/pkg/errors"
 )
 
 type fakeBackend struct {
@@ -28,7 +30,7 @@ func (f *fakeBackend) Submit(task backend.Task) (backend.TaskID, error) {
 	f.nextTaskID++
 	return f.nextTaskID, nil
 }
-func (f *fakeBackend) Cancel(backend.TaskID) bool                 { return false }
+func (f *fakeBackend) Cancel(backend.TaskID) bool { return false }
 
 func (f *fakeBackend) DrainResults(_ backend.WorldID, max int) []backend.Result {
 	if max <= 0 || len(f.results) == 0 {
@@ -82,8 +84,8 @@ func TestNewWorldAutomaticallyAssignsDistinctWorldIDs(t *testing.T) {
 
 type worldTestTask struct{ meta backend.TaskMeta }
 
-func (t worldTestTask) Meta() backend.TaskMeta                  { return t.meta }
-func (worldTestTask) Policy() backend.TaskPolicy                { return backend.TaskPolicy{} }
+func (t worldTestTask) Meta() backend.TaskMeta             { return t.meta }
+func (worldTestTask) Policy() backend.TaskPolicy           { return backend.TaskPolicy{} }
 func (worldTestTask) Execute(context.Context) (any, error) { return nil, nil }
 
 func TestWorldSubmitsValidatedTaskToAttachedBackend(t *testing.T) {
@@ -285,5 +287,151 @@ func TestBackendResultIsAppliedAtMostOncePerTaskID(t *testing.T) {
 	}
 	if applied != 1 {
 		t.Fatalf("duplicate result applied %d times, want 1", applied)
+	}
+}
+
+func TestSubmitTaskFuncPassesBackendErrorToCallback(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldID = 12
+	cfg.RoomID = "room-12"
+
+	w, err := NewWorldWithBackend(cfg)
+	if err != nil {
+		t.Fatalf("NewWorldWithBackend() error = %v", err)
+	}
+
+	expectedErr := errors.New("backend task failed")
+
+	var callbackValue any
+	var callbackErr error
+	callbackCalled := false
+
+	taskID, err := w.SubmitTaskFunc(
+		func(ctx context.Context) (any, error) {
+			return nil, expectedErr
+		},
+		func(value any, err error) {
+			callbackCalled = true
+			callbackValue = value
+			callbackErr = err
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitTaskFunc() error = %v", err)
+	}
+
+	if taskID == 0 {
+		t.Fatal("SubmitTaskFunc() returned zero task ID")
+	}
+
+	deadline := time.Now().Add(time.Second)
+
+	for !callbackCalled {
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for failed task callback")
+		}
+
+		if err := w.Step(
+			context.Background(),
+			w.Tick()+1,
+			50*time.Millisecond,
+			nil,
+		); err != nil {
+			t.Fatalf("Step() error = %v", err)
+		}
+
+		if !callbackCalled {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if callbackValue != nil {
+		t.Fatalf(
+			"callback value = %#v, want nil",
+			callbackValue,
+		)
+	}
+
+	if !errors.Is(callbackErr, expectedErr) {
+		t.Fatalf(
+			"callback error = %v, want %v",
+			callbackErr,
+			expectedErr,
+		)
+	}
+}
+
+func TestSubmitTaskFuncRunsCallbackDuringWorldStep(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldID = 11
+	cfg.RoomID = "room-11"
+
+	w, err := NewWorldWithBackend(cfg)
+	if err != nil {
+		t.Fatalf("NewWorldWithBackend() error = %v", err)
+	}
+
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Fatalf("World.Close() error = %v", err)
+		}
+	}()
+
+	callbackCount := 0
+	var callbackValue any
+	var callbackErr error
+	
+	taskID, err := w.SubmitTaskFunc(
+		func(ctx context.Context) (any, error) {
+			return "async-value", nil
+		},
+		func(value any, err error) {
+			callbackCount++
+			callbackValue = value
+			callbackErr = err
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitTaskFunc() error = %v", err)
+	}
+
+	if taskID == 0 {
+		t.Fatal("SubmitTaskFunc() returned zero task ID")
+	}
+
+	if callbackCount != 0 {
+		t.Fatal("callback ran before World.Step")
+	}
+
+	deadline := time.Now().Add(time.Second)
+
+	for callbackCount == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for SubmitTaskFunc callback")
+		}
+
+		if err := w.Step(
+			context.Background(),
+			w.Tick()+1,
+			50*time.Millisecond,
+			nil,
+		); err != nil {
+			t.Fatalf("Step() error = %v", err)
+		}
+
+		if callbackCount == 0 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if callbackValue != "async-value" {
+		t.Fatalf(
+			"callback value = %#v, want async-value",
+			callbackValue,
+		)
+	}
+
+	if callbackErr != nil {
+		t.Fatalf("callback error = %v, want nil", callbackErr)
 	}
 }

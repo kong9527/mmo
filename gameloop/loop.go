@@ -253,7 +253,10 @@ func stopAndDrainTimer(timer *time.Timer) {
 }
 
 func (l *Loop) Stop(ctx context.Context) error {
-	l.stopOnce.Do(func() { close(l.stopCh) })
+	l.stopOnce.Do(func() {
+		_ = l.world.Close()
+		close(l.stopCh)
+	})
 	select {
 	case <-l.doneCh:
 		return nil

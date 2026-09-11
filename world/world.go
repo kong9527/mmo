@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"mmo/backend"
 	"mmo/gameloop"
 )
@@ -49,6 +51,10 @@ type system interface {
 	Name() string
 	// Update 在本 Tick 内遍历所有实体，执行该领域的逻辑。
 	Update(context.Context, *World, TickContext) error
+}
+
+type backendCloser interface {
+	Close(context.Context) error
 }
 
 // World 是 Update 系统的核心——实现 gameloop.World 接口的模拟世界。
@@ -101,10 +107,13 @@ type World struct {
 	pendingSpawns   []spawnRequest
 	pendingRemovals []EntityID
 
+	backendOwner backendCloser
+	
 	// Backend 只提供结果邮箱；所有 handler 都在 World.Step goroutine 内执行。
-	backend             backend.Service
-	backendHandlers     map[backend.TaskKind]BackendResultHandler
-	pendingBackendTasks map[backend.TaskID]struct{}
+	backend              backend.Service
+	backendHandlers      map[backend.TaskKind]BackendResultHandler
+	pendingBackendTasks  map[backend.TaskID]struct{}
+	backendFuncCallbacks map[backend.TaskID]FuncCallback
 }
 
 // NewWorld 创建并初始化一个新的游戏世界。
@@ -118,24 +127,26 @@ func NewWorld(cfg Config) (*World, error) {
 	}
 	capacity := cfg.MaxEntities
 	w := &World{
-		cfg:                 cfg,
-		entities:            make(map[EntityID]entityRecord, capacity),
-		players:             make(map[string]EntityID, capacity),
-		transforms:          newStore[Transform](capacity),
-		movements:           newStore[Movement](capacity),
-		health:              newStore[Health](capacity),
-		combat:              newStore[Combat](capacity),
-		ai:                  newStore[AI](capacity),
-		playerState:         newStore[PlayerState](capacity),
-		buffs:               newStore[[]Buff](capacity),
-		events:              make([]Event, 0, capacity),
-		eventQueue:          NewEventQueue(128),
-		attackIntents:       make([]attackIntent, 0, capacity),
-		pendingSpawns:       make([]spawnRequest, 0, 16),
-		pendingRemovals:     make([]EntityID, 0, 16),
-		backendHandlers:     make(map[backend.TaskKind]BackendResultHandler),
-		pendingBackendTasks: make(map[backend.TaskID]struct{}),
+		cfg:                  cfg,
+		entities:             make(map[EntityID]entityRecord, capacity),
+		players:              make(map[string]EntityID, capacity),
+		transforms:           newStore[Transform](capacity),
+		movements:            newStore[Movement](capacity),
+		health:               newStore[Health](capacity),
+		combat:               newStore[Combat](capacity),
+		ai:                   newStore[AI](capacity),
+		playerState:          newStore[PlayerState](capacity),
+		buffs:                newStore[[]Buff](capacity),
+		events:               make([]Event, 0, capacity),
+		eventQueue:           NewEventQueue(128),
+		attackIntents:        make([]attackIntent, 0, capacity),
+		pendingSpawns:        make([]spawnRequest, 0, 16),
+		pendingRemovals:      make([]EntityID, 0, 16),
+		backendHandlers:      make(map[backend.TaskKind]BackendResultHandler),
+		pendingBackendTasks:  make(map[backend.TaskID]struct{}),
+		backendFuncCallbacks: make(map[backend.TaskID]FuncCallback),
 	}
+	w.RegisterBackendResultHandler(funcTaskKind, funcResultHandler)
 	w.systems = []system{
 		movementSystem{},
 		aiSystem{},
@@ -144,6 +155,26 @@ func NewWorld(cfg Config) (*World, error) {
 		recoverySystem{},
 		cleanupSystem{},
 	}
+	return w, nil
+}
+
+func NewWorldWithBackend(cfg Config) (*World, error) {
+	w, err := NewWorld(cfg)
+	if err != nil {
+		return nil, errors.Wrap(err, "world failed")
+	}
+
+	executor, err := backend.New(backend.DefaultConfig())
+	if err != nil {
+		return nil, errors.Wrap(err, "executor failed")
+	}
+	if err = w.AttachBackend(executor); err != nil {
+		return nil, errors.Wrap(err, "attach failed")
+	}
+
+	// 标记为 World 自己拥有的 Backend。
+	w.backendOwner = executor
+
 	return w, nil
 }
 
@@ -160,6 +191,32 @@ func allocateWorldID(requested WorldID) WorldID {
 			return requested
 		}
 	}
+}
+
+// Close 关闭 World 及其由 World 自己创建的 Backend。
+//
+// 如果 Backend 是通过 AttachBackend 外部注入的，Close 只会解除 World
+// 与 Backend 的绑定，不会关闭外部 Backend。
+func (w *World) Close() error {
+	if w.stepping {
+		return ErrAlreadyStepping
+	}
+
+	// 保存 World 自己拥有的 Backend。
+	owner := w.backendOwner
+
+	// 解绑 World 的结果邮箱。
+	// DetachBackend 不会关闭外部 Backend。
+	w.DetachBackend()
+
+	// 防止重复关闭。
+	w.backendOwner = nil
+
+	if owner == nil {
+		return nil
+	}
+
+	return owner.Close(context.Background())
 }
 
 // Config 返回世界的运行配置（只读）。

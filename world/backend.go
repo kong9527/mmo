@@ -1,6 +1,41 @@
 package world
 
-import "mmo/backend"
+import (
+	"context"
+	"mmo/backend"
+)
+
+const funcTaskKind = ^backend.TaskKind(0)
+
+// AsyncFunc 是在 Backend goroutine 中执行的函数。
+type AsyncFunc func(ctx context.Context) (any, error)
+
+// FuncCallback 会在 World goroutine 的后续 Tick 中执行。
+type FuncCallback func(value any, err error)
+
+func funcResultHandler(world *World, result backend.Result) {
+	world.handleFuncResult(result)
+}
+
+// funcTask 将普通函数包装成 backend.Task。
+type funcTask struct {
+	meta backend.TaskMeta
+	fn   AsyncFunc
+}
+
+var _ backend.Task = (*funcTask)(nil)
+
+func (t *funcTask) Meta() backend.TaskMeta {
+	return t.meta
+}
+
+func (t *funcTask) Policy() backend.TaskPolicy {
+	return backend.TaskPolicy{}
+}
+
+func (t *funcTask) Execute(ctx context.Context) (any, error) {
+	return t.fn(ctx)
+}
 
 // BackendResultHandler applies one immutable Backend result inside World.Step.
 // The handler may mutate World because it always runs in the World goroutine.
@@ -21,6 +56,10 @@ func (w *World) AttachBackend(service backend.Service) error {
 		return err
 	}
 	w.backend = service
+
+	// 外部传入的 Backend 不由 World 负责关闭。
+	w.backendOwner = nil
+	
 	return nil
 }
 
@@ -32,6 +71,7 @@ func (w *World) DetachBackend() {
 	w.backend.UnregisterWorld(backend.WorldID(w.cfg.WorldID))
 	w.backend = nil
 	clear(w.pendingBackendTasks)
+	clear(w.backendFuncCallbacks)
 }
 
 // RegisterBackendResultHandler binds a task kind to World-owned result logic.
@@ -68,6 +108,46 @@ func (w *World) SubmitBackendTask(task backend.Task) (backend.TaskID, error) {
 	}
 	w.pendingBackendTasks[taskID] = struct{}{}
 	return taskID, nil
+}
+
+// SubmitTaskFunc 提交一个函数任务到 Backend 执行。
+// work 在 Backend worker goroutine 中执行。
+// onComplete 会在任务完成后的下一个 World Tick 中执行。
+func (w *World) SubmitTaskFunc(work AsyncFunc, onComplete FuncCallback) (backend.TaskID, error) {
+	if work == nil || onComplete == nil {
+		return 0, backend.ErrInvalidTask
+	}
+
+	task := &funcTask{
+		meta: backend.TaskMeta{
+			Kind:       funcTaskKind,
+			WorldID:    backend.WorldID(w.cfg.WorldID),
+			RoomID:     w.cfg.RoomID,
+			SubmitTick: w.tick,
+		},
+		fn: work,
+	}
+
+	taskID, err := w.SubmitBackendTask(task)
+	if err != nil {
+		return 0, err
+	}
+
+	w.backendFuncCallbacks[taskID] = onComplete
+
+	return taskID, nil
+}
+
+// handleFuncResult 必须在 World goroutine 中调用。
+func (w *World) handleFuncResult(result backend.Result) {
+	callback := w.backendFuncCallbacks[result.Meta.TaskID]
+	delete(w.backendFuncCallbacks, result.Meta.TaskID)
+
+	if callback == nil {
+		return
+	}
+
+	callback(result.Data, result.Err)
 }
 
 func (w *World) consumeBackendResults() {

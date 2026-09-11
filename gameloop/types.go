@@ -20,6 +20,7 @@ type Command struct {
 type World interface {
 	Step(ctx context.Context, tick uint64, dt time.Duration, commands []Command) error
 	Snapshot(ctx context.Context, tick uint64) (any, error)
+	Close() error
 }
 
 // SnapshotPublisher 将只读快照发送给网关、广播层或持久化层。
